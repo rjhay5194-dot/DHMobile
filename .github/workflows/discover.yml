@@ -1,0 +1,102 @@
+name: DH source discovery
+
+# One-file helper. It downloads Distant Horizons' source on GitHub's servers,
+# tries an unmodified build, and packs the important files for me to read.
+# Run: Actions tab > this workflow > latest run > Artifacts (dh-map, dh-source).
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Distant Horizons branch or tag (blank = default branch)'
+        required: false
+        default: ''
+      mc:
+        description: 'Minecraft version to build'
+        required: false
+        default: '1.21.11'
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Fetch, map and test-build Distant Horizons
+        env:
+          DH_REF: ${{ inputs.ref }}
+          MC_VERSION: ${{ inputs.mc || '1.21.11' }}
+        run: |
+          MC="${MC_VERSION:-1.21.11}"
+          mkdir -p out/src
+
+          # 1) get Distant Horizons (GitLab) with its core submodule
+          if [ -n "$DH_REF" ]; then B="--branch $DH_REF"; else B=""; fi
+          git clone --depth 1 $B --recurse-submodules --shallow-submodules https://gitlab.com/distant-horizons-team/distant-horizons.git dh
+          cd dh
+
+          # 2) basic facts
+          {
+            echo "== commit"; git log -1 --format='%H %cd %s'
+            echo "== submodules"; git submodule status
+            echo "== version property files"; find . -path ./.git -prune -o -name '*.properties' -path '*ersion*' -print | sort
+            echo "== top level"; ls -la
+            echo "== README build lines"; grep -n -i -E 'gradlew|compile|assemble' README.md | head -30
+          } > ../out/facts.txt 2>&1
+
+          # 3) full source tree with sizes
+          find . \( -path ./.git -o -path '*/.git' \) -prune -o -type f \
+            \( -name '*.java' -o -name '*.gradle' -o -name '*.properties' -o -name '*.glsl' -o -name '*.vert' -o -name '*.frag' -o -name '*.vsh' -o -name '*.fsh' -o -name '*.json' \) \
+            -printf '%s %p\n' | sort -k2 > ../out/tree.txt
+          wc -l ../out/tree.txt
+
+          # 4) copy the files that matter for memory / drawing / generation (max 250 KB each, 8 MB total)
+          PATTERN='(LodRenderer|LodBufferContainer|ColumnRenderBuffer|LodQuadBuilder|RenderBufferHandler|LodBufferBuilder|GLBuffer|GLProxy|LodRenderProgram|QuadElementBuffer|GLVertexBuffer|ColumnRenderSource|FullDataSource|BatchGenerationEnvironment|WorldGenerationQueue|WorldGenerator|ThreadPool|PhantomArrayListPool|ArrayListCache|DhThreadFactory|LodDataBuilder|FullDataToRenderDataTransformer|ChunkToLodBuilder|GenerationQueue|DataSourceProvider|Config\.java|[Ss]hader|\.glsl|\.vert|\.frag|\.vsh|\.fsh)'
+          TOTAL=0; LIMIT=$((8*1024*1024)); COUNT=0
+          while read -r size path; do
+            case "$path" in *.java|*.glsl|*.vert|*.frag|*.vsh|*.fsh) ;; *) continue ;; esac
+            [ "$size" -lt 250000 ] || continue
+            echo "$path" | grep -Eq "$PATTERN" || continue
+            [ $((TOTAL + size)) -le $LIMIT ] || break
+            cp --parents "$path" ../out/src/ && TOTAL=$((TOTAL + size)) && COUNT=$((COUNT + 1))
+          done < ../out/tree.txt
+          echo "copied $COUNT files, $TOTAL bytes" | tee ../out/copied.txt
+
+          # 5) try an unmodified build so we know the pipeline works
+          export GRADLE_OPTS="-Xmx4g"
+          chmod +x gradlew 2>/dev/null || true
+          if ./gradlew fabric:assemble -PmcVer="$MC" --no-daemon --console=plain > ../out/build-log.txt 2>&1 \
+             || ./gradlew assemble -PmcVer="$MC" --no-daemon --console=plain >> ../out/build-log.txt 2>&1; then
+            echo "BUILD OK" > ../out/build-result.txt
+          else
+            echo "BUILD FAILED" > ../out/build-result.txt
+          fi
+          tail -n 120 ../out/build-log.txt > ../out/build-tail.txt || true
+          find . -name '*.jar' -path '*build/libs*' -printf '%s %p\n' > ../out/jars.txt 2>/dev/null || true
+          cat ../out/build-result.txt
+          exit 0
+      - name: Zip the source selection
+        if: always()
+        run: |
+          cd out
+          zip -r -q ../dh-source.zip src || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dh-map
+          path: |
+            out/facts.txt
+            out/tree.txt
+            out/copied.txt
+            out/build-result.txt
+            out/build-tail.txt
+            out/jars.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dh-source
+          path: dh-source.zip
