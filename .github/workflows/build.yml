@@ -1,0 +1,470 @@
+name: Build DH Low-End
+
+# One-file project: this workflow contains the whole mod and builds the jar.
+# After a run finishes: Actions tab > latest run > Artifacts > dh-lowend-jar
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build jar
+        run: |
+          set -e
+          mkdir -p src/dhlowend out
+          cat > src/dhlowend/DhLowEnd.java <<'JAVA_EOF'
+          package dhlowend;
+
+          import net.fabricmc.api.ClientModInitializer;
+
+          import java.lang.management.ManagementFactory;
+          import java.lang.management.MemoryPoolMXBean;
+          import java.lang.management.MemoryType;
+          import java.lang.management.MemoryUsage;
+          import java.lang.reflect.Method;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.io.InputStream;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Properties;
+
+          /**
+           * DH Low-End: a tiny client add-on that puts Distant Horizons into low RAM / CPU / GPU settings.
+           *
+           * It talks to Distant Horizons only through reflection on its public API, so it needs no
+           * extra libraries and keeps working when DH changes (a setting DH does not have is just skipped).
+           *
+           * Settings file: config/dh-lowend.properties (edit and save; applies within ~5 seconds).
+           */
+          public final class DhLowEnd implements ClientModInitializer {
+
+              static final String TAG = "[DH Low-End] ";
+              static final String SHOWN_NAME = "DH Low-End"; // DH shows this next to options we control
+              static final String API = "com.seibel.distanthorizons.api.";
+              static final Path CFG_FILE = Path.of("config", "dh-lowend.properties");
+
+              record Alt(String path, Object value) {}
+              record Setting(String label, List<Alt> alts) {}
+              record EnumRef(String className, String constant) {}
+
+              static final class Cfg {
+                  String preset = "potato";      // potato | low | balanced | off
+                  int lodDistance = 0;           // chunks, 0 = use the preset value
+                  String generation = "preset";  // preset | off | surface | full
+                  boolean memoryGuard = true;
+                  int minDistance = 16;
+              }
+
+              static final List<Object> applied = new ArrayList<>(); // DH config values we currently control
+              static Cfg cfg = new Cfg();
+              static Object configsRef;
+              static int targetDistance, currentDistance, guardHigh, guardLow;
+              static final ClassLoader LOADER = DhLowEnd.class.getClassLoader();
+
+              @Override
+              public void onInitializeClient() {
+                  Thread t = new Thread(DhLowEnd::run, "dh-lowend");
+                  t.setDaemon(true);
+                  t.start();
+              }
+
+              // ------------------------------------------------------------------ main loop
+
+              static void run() {
+                  try {
+                      Class.forName(API + "DhApi$Delayed", false, LOADER);
+                  } catch (Throwable t) {
+                      log("Distant Horizons not found, nothing to do.");
+                      return;
+                  }
+                  long start = System.currentTimeMillis();
+                  while ((configsRef = getConfigs()) == null) {
+                      if (System.currentTimeMillis() - start > 30 * 60_000L) {
+                          log("Distant Horizons never finished starting, giving up.");
+                          return;
+                      }
+                      sleep(2000);
+                  }
+                  long seen = Long.MIN_VALUE;
+                  for (;;) {
+                      try {
+                          long m = mtime();
+                          if (m != seen) {
+                              loadCfg();
+                              seen = mtime();
+                              applyAll();
+                          } else if (cfg.memoryGuard && !isOff()) {
+                              guardStep(Mem.liveFraction());
+                          }
+                      } catch (Throwable t) {
+                          log("error: " + t);
+                      }
+                      sleep(5000);
+                  }
+              }
+
+              static Object getConfigs() {
+                  try {
+                      Class<?> c = Class.forName(API + "DhApi$Delayed", true, LOADER);
+                      return c.getField("configs").get(null);
+                  } catch (Throwable t) {
+                      return null;
+                  }
+              }
+
+              // ------------------------------------------------------------------ config file
+
+              static long mtime() {
+                  try {
+                      return Files.exists(CFG_FILE) ? Files.getLastModifiedTime(CFG_FILE).toMillis() : -1;
+                  } catch (Throwable t) {
+                      return -1;
+                  }
+              }
+
+              static void loadCfg() {
+                  try {
+                      if (!Files.exists(CFG_FILE)) {
+                          Files.createDirectories(CFG_FILE.getParent());
+                          Files.writeString(CFG_FILE, DEFAULT_FILE, StandardCharsets.UTF_8);
+                      }
+                      Properties p = new Properties();
+                      try (InputStream in = Files.newInputStream(CFG_FILE)) {
+                          p.load(in);
+                      }
+                      Cfg c = new Cfg();
+                      c.preset = p.getProperty("preset", c.preset).trim().toLowerCase();
+                      if (!List.of("potato", "low", "balanced", "off").contains(c.preset)) c.preset = "potato";
+                      c.lodDistance = parseInt(p.getProperty("lod_distance"), 0);
+                      c.generation = p.getProperty("distant_generation", c.generation).trim().toLowerCase();
+                      if (!List.of("preset", "off", "surface", "full").contains(c.generation)) c.generation = "preset";
+                      c.memoryGuard = !"false".equalsIgnoreCase(p.getProperty("memory_guard", "true").trim());
+                      c.minDistance = Math.max(8, parseInt(p.getProperty("memory_guard_min_distance"), 16));
+                      cfg = c;
+                  } catch (Throwable t) {
+                      log("could not read " + CFG_FILE + ": " + t + " (using defaults)");
+                      cfg = new Cfg();
+                  }
+              }
+
+              static int parseInt(String s, int def) {
+                  try {
+                      return s == null ? def : Integer.parseInt(s.trim());
+                  } catch (NumberFormatException e) {
+                      return def;
+                  }
+              }
+
+              static final String DEFAULT_FILE = """
+                      # DH Low-End settings. Edit, save, and it applies within ~5 seconds (no restart).
+                      #
+                      # preset: potato | low | balanced | off
+                      #   potato   = lowest RAM / CPU / GPU use (LOD distance 32)
+                      #   low      = a bit nicer (LOD distance 48)
+                      #   balanced = nicest of the three (LOD distance 64)
+                      #   off      = give control back to Distant Horizons
+                      preset=potato
+
+                      # LOD distance in chunks. 0 = use the preset's value.
+                      lod_distance=0
+
+                      # Distant terrain generation: preset | off | surface | full
+                      #   off = never generate, only show terrain you already visited (lowest CPU)
+                      distant_generation=preset
+
+                      # Automatically lower the LOD distance while Java memory stays nearly full,
+                      # and raise it again when memory frees up.
+                      memory_guard=true
+                      memory_guard_min_distance=16
+                      """;
+
+              // ------------------------------------------------------------------ applying settings
+
+              static boolean isOff() {
+                  return "off".equals(cfg.preset);
+              }
+
+              static int presetIndex() {
+                  return switch (cfg.preset) {
+                      case "low" -> 1;
+                      case "balanced" -> 2;
+                      default -> 0;
+                  };
+              }
+
+              static Object pick(int i, Object a, Object b, Object c) {
+                  return i == 0 ? a : i == 1 ? b : c;
+              }
+
+              static EnumRef cfgEnum(String cls, String c) {
+                  return new EnumRef(API + "enums.config." + cls, c);
+              }
+
+              static EnumRef renderEnum(String cls, String c) {
+                  return new EnumRef(API + "enums.rendering." + cls, c);
+              }
+
+              static EnumRef genEnum(String cls, String c) {
+                  return new EnumRef(API + "enums.worldGeneration." + cls, c);
+              }
+
+              static Setting one(String label, String path, Object value) {
+                  return new Setting(label, List.of(new Alt(path, value)));
+              }
+
+              static List<Setting> settings(int i) {
+                  List<Setting> l = new ArrayList<>();
+                  l.add(one("LOD distance", "graphics.chunkRenderDistance", currentDistance));
+                  l.add(one("horizontal resolution", "graphics.maxHorizontalResolution",
+                          cfgEnum("EDhApiMaxHorizontalResolution", (String) pick(i, "HALF_CHUNK", "FOUR_BLOCKS", "TWO_BLOCKS"))));
+                  l.add(one("vertical quality", "graphics.verticalQuality",
+                          cfgEnum("EDhApiVerticalQuality", (String) pick(i, "HEIGHT_MAP", "LOW", "MEDIUM"))));
+                  l.add(one("horizontal quality", "graphics.horizontalQuality",
+                          cfgEnum("EDhApiHorizontalQuality", (String) pick(i, "LOWEST", "LOW", "MEDIUM"))));
+                  l.add(one("transparency", "graphics.transparency",
+                          renderEnum("EDhApiTransparency", (String) pick(i, "DISABLED", "DISABLED", "COMPLETE"))));
+                  l.add(one("skip small blocks", "graphics.blocksToAvoid", cfgEnum("EDhApiBlocksToAvoid", "NON_COLLIDING")));
+                  l.add(one("ambient occlusion", "graphics.ambientOcclusion.enabled", false));
+                  l.add(one("noise texture", "graphics.noiseTexture.noiseEnabled", false));
+                  l.add(one("LOD textures", "graphics.texture.texturesEnabled", pick(i, false, false, true)));
+                  l.add(one("cave culling", "graphics.caveCullingEnabled", true));
+                  l.add(one("frustum culling", "graphics.disableFrustumCulling", false));
+                  l.add(one("DH thread count", "multiThreading.threadCount", pick(i, 1, 2, 3)));
+                  l.add(one("DH thread run ratio", "multiThreading.threadRuntimeRatio", pick(i, 0.25, 0.4, 0.6)));
+
+                  String g = cfg.generation.equals("preset") ? (String) pick(i, "surface", "surface", "full") : cfg.generation;
+                  String plan = g.equals("off") ? "DISABLED" : g.equals("surface") ? "SURFACE_ONLY" : "SURFACE_THEN_CHUNK";
+                  String mode = g.equals("off") ? "PRE_EXISTING_ONLY" : g.equals("surface") ? "SURFACE" : "FEATURES";
+                  l.add(new Setting("distant generation", List.of(
+                          new Alt("worldGenerator.GeneratorPlan", genEnum("EDhApiGeneratorPlan", plan)),
+                          new Alt("worldGenerator.enableDistantWorldGeneration", !g.equals("off")))));
+                  l.add(new Setting("generation level", List.of(
+                          new Alt("worldGenerator.chunkGeneratorMode", genEnum("EDhApiDistantGeneratorMode", mode)),
+                          new Alt("worldGenerator.distantGeneratorMode", genEnum("EDhApiDistantGeneratorMode", mode)))));
+                  return l;
+              }
+
+              static void applyAll() {
+                  releaseAll();
+                  guardHigh = guardLow = 0;
+                  if (isOff()) {
+                      log("preset=off: Distant Horizons has control again.");
+                      return;
+                  }
+                  int i = presetIndex();
+                  targetDistance = Math.max(8, cfg.lodDistance > 0 ? cfg.lodDistance : (Integer) pick(i, 32, 48, 64));
+                  currentDistance = targetDistance;
+                  int ok = 0;
+                  List<String> bad = new ArrayList<>();
+                  for (Setting s : settings(i)) {
+                      if (applyOne(s)) ok++;
+                      else bad.add(s.label());
+                  }
+                  log("preset '" + cfg.preset + "' applied (" + ok + " settings, LOD distance " + currentDistance + ")"
+                          + (bad.isEmpty() ? "" : "; not available in this DH version: " + bad));
+              }
+
+              static boolean applyOne(Setting s) {
+                  for (Alt a : s.alts()) {
+                      try {
+                          Object cv = navigate(configsRef, a.path());
+                          if (cv == null) continue;
+                          Object v = convert(cv, a.value());
+                          if (setValue(cv, v)) {
+                              boolean known = false;
+                              for (Object o : applied) {
+                                  if (o == cv) {
+                                      known = true;
+                                      break;
+                                  }
+                              }
+                              if (!known) applied.add(cv);
+                              return true;
+                          }
+                      } catch (Throwable ignored) {
+                          // try the next alternative
+                      }
+                  }
+                  return false;
+              }
+
+              static void releaseAll() {
+                  for (Object cv : applied) {
+                      try {
+                          call0(cv, "clearValue");
+                      } catch (Throwable ignored) {
+                      }
+                  }
+                  applied.clear();
+              }
+
+              // ------------------------------------------------------------------ memory guard
+
+              /** Called every 5 s with the fraction of the Java heap that is live (after GC). */
+              static void guardStep(double frac) {
+                  int min = Math.min(cfg.minDistance, targetDistance);
+                  if (frac > 0.85) {
+                      guardLow = 0;
+                      if (++guardHigh >= 3 && currentDistance > min) {
+                          currentDistance = Math.max(min, currentDistance - 8);
+                          pushDistance();
+                          log("memory is nearly full, LOD distance lowered to " + currentDistance);
+                          guardHigh = 0;
+                      }
+                  } else if (frac < 0.65) {
+                      guardHigh = 0;
+                      if (++guardLow >= 24 && currentDistance < targetDistance) {
+                          currentDistance = Math.min(targetDistance, currentDistance + 8);
+                          pushDistance();
+                          log("memory is fine again, LOD distance raised to " + currentDistance);
+                          guardLow = 0;
+                      }
+                  } else {
+                      guardHigh = guardLow = 0;
+                  }
+              }
+
+              static void pushDistance() {
+                  applyOne(one("LOD distance", "graphics.chunkRenderDistance", currentDistance));
+              }
+
+              /** Kept in its own class so java.management is only touched when actually called. */
+              static final class Mem {
+                  static double liveFraction() {
+                      long max = Runtime.getRuntime().maxMemory();
+                      try {
+                          long live = 0;
+                          boolean any = false;
+                          for (MemoryPoolMXBean p : ManagementFactory.getMemoryPoolMXBeans()) {
+                              if (p.getType() == MemoryType.HEAP) {
+                                  MemoryUsage u = p.getCollectionUsage();
+                                  if (u != null) {
+                                      live += u.getUsed();
+                                      any = true;
+                                  }
+                              }
+                          }
+                          if (any && live > 0) return (double) live / max;
+                      } catch (Throwable ignored) {
+                      }
+                      Runtime r = Runtime.getRuntime();
+                      return (double) (r.totalMemory() - r.freeMemory()) / max;
+                  }
+              }
+
+              // ------------------------------------------------------------------ reflection helpers
+
+              static Object navigate(Object root, String path) throws Exception {
+                  Object o = root;
+                  for (String seg : path.split("\\.")) {
+                      if (o == null) return null;
+                      o = call0(o, seg);
+                  }
+                  return o;
+              }
+
+              static Object call0(Object o, String name) throws Exception {
+                  for (Method m : o.getClass().getMethods()) {
+                      if (m.getName().equals(name) && m.getParameterCount() == 0) {
+                          try {
+                              m.setAccessible(true);
+                          } catch (Throwable ignored) {
+                          }
+                          return m.invoke(o);
+                      }
+                  }
+                  throw new NoSuchMethodException(name);
+              }
+
+              @SuppressWarnings({"unchecked", "rawtypes"})
+              static Object convert(Object cv, Object v) throws Exception {
+                  if (v instanceof EnumRef r) {
+                      Class<?> c = Class.forName(r.className(), true, LOADER);
+                      return Enum.valueOf((Class) c, r.constant());
+                  }
+                  if (v instanceof Number n) {
+                      double d = n.doubleValue();
+                      Object mn = safe0(cv, "getMinValue"), mx = safe0(cv, "getMaxValue"), def = safe0(cv, "getDefaultValue");
+                      if (mn instanceof Number x) d = Math.max(d, x.doubleValue());
+                      if (mx instanceof Number x) d = Math.min(d, x.doubleValue());
+                      if (def instanceof Integer) return (int) Math.round(d);
+                      if (def instanceof Long) return Math.round(d);
+                      if (def instanceof Float) return (float) d;
+                      if (def instanceof Double) return d;
+                      return v;
+                  }
+                  return v;
+              }
+
+              static Object safe0(Object o, String name) {
+                  try {
+                      return call0(o, name);
+                  } catch (Throwable t) {
+                      return null;
+                  }
+              }
+
+              static boolean setValue(Object cv, Object v) throws Exception {
+                  Method one = null, two = null;
+                  for (Method m : cv.getClass().getMethods()) {
+                      if (!m.getName().equals("setValue")) continue;
+                      if (m.getParameterCount() == 2) two = m;
+                      else if (m.getParameterCount() == 1) one = m;
+                  }
+                  Method m = two != null ? two : one;
+                  if (m == null) return false;
+                  try {
+                      m.setAccessible(true);
+                  } catch (Throwable ignored) {
+                  }
+                  Object r = two != null ? m.invoke(cv, v, SHOWN_NAME) : m.invoke(cv, v);
+                  return !(r instanceof Boolean b) || b;
+              }
+
+              static void sleep(long ms) {
+                  try {
+                      Thread.sleep(ms);
+                  } catch (InterruptedException e) {
+                      Thread.currentThread().interrupt();
+                  }
+              }
+
+              static void log(String s) {
+                  System.out.println(TAG + s);
+              }
+          }
+          JAVA_EOF
+          cat > out/fabric.mod.json <<'JSON_EOF'
+          {
+            "schemaVersion": 1,
+            "id": "dh_lowend",
+            "version": "1.0.0",
+            "name": "DH Low-End",
+            "description": "Puts Distant Horizons into low RAM / CPU / GPU settings for weak phones.",
+            "authors": ["you"],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": { "client": ["dhlowend.DhLowEnd"] },
+            "depends": { "fabricloader": ">=0.15.0", "java": ">=21" },
+            "suggests": { "distanthorizons": "*" }
+          }
+          JSON_EOF
+          for v in 0.18.1 0.17.3 0.16.14; do
+            if curl -fsSL -o loader.jar "https://maven.fabricmc.net/net/fabricmc/fabric-loader/$v/fabric-loader-$v.jar"; then break; fi
+          done
+          test -s loader.jar
+          javac --release 21 -cp loader.jar -d out src/dhlowend/DhLowEnd.java
+          jar --create --file dh-lowend-1.0.0.jar -C out .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dh-lowend-jar
+          path: dh-lowend-1.0.0.jar
